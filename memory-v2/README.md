@@ -1,83 +1,121 @@
 # Memory V2 — Hermes Agent 长期记忆系统
 
-从 Hermes Agent 的对话历史中自动提取有价值记忆，存入 SQLite 数据库，实现长期积累。
+从对话历史中自动提取有价值记忆，存入 SQLite，实现跨会话知识积累。
 
-## 核心设计
+## 一句话原理
 
 ```
-state.db (原始对话)  →  session_extractor  →  memory_v2.db (精选记忆)
-     476会话/13K消息         ↓                       309条记忆
-                    提取引擎 + 去重                  272KB
-                           ↓
-                    每小时增量cron
+state.db (476会话, 1.8万条消息)
+    │
+    ▼ 每小时 cron + 会话结束钩子
+memory_v2.db (精选记忆, 无限存储)
+```
+
+## 架构
+
+```
+┌─────────────────────────┐
+│       state.db          │  ← Hermes Agent 原始对话
+│  (476会话, 13K消息)      │
+└───────────┬─────────────┘
+            │
+            ├─ batch_extractor.py   ← 每小时增量提取 (cron)
+            ├─ session_extractor.py ← 会话结束钩子 (自动)
+            ├─ hourly_extractor.py  ← cron 专用入口
+            └─ recall_v2.py         ← 检索工具
+            │
+            ▼
+┌─────────────────────────┐
+│     memory_v2.db         │  ← 精选记忆 (无限)
+│  memory_index  (300+条)  │
+│  topics        (50+个)   │
+│  knowledge_graph         │
+└─────────────────────────┘
 ```
 
 ## 记忆分类
 
-| 类型 | 说明 | 典型关键词 |
-|------|------|-----------|
-| reward | 完成成果 | ✅ / 搞定 / 成功 / 配置完成 |
-| insight | 发现/教训 | 找到问题 / 原因 / 关键 / 本质 |
-| error | 错误/bug | Traceback / 报错 / 失败 |
-| constraint | 原则/禁止 | 禁止 / 红线 / 必须 |
-| preference | 用户偏好 | 偏好 / 喜欢 / 讨厌 / 希望 |
+| 类型 | 含义 | 颜色 |
+|------|------|------|
+| `reward` | 完成成果、配置成功 | 🟢 |
+| `insight` | 发现教训、定位原因 | 🔍 |
+| `error` | 错误/bug/失败 | 🔴 |
+| `constraint` | 原则/禁止/必须 | 🔵 |
+| `preference` | 用户偏好/习惯 | 🟡 |
 
 ## 快速开始
 
 ### 安装
+
 ```bash
-git clone https://github.com/shishenshashen/memory-v2.git
-cd memory-v2
+# 克隆仓库（依赖 scripts/ 下的脚本）
+git clone https://github.com/shishensbashen/AI_home.git
+cd AI_home/memory-v2
 ```
 
-### 提取历史会话
-```bash
-# 精简模式：只提取 reward + insight + error（推荐，历史一次性）
-python3 scripts/session_extractor.py <session_id> --mode compact
+### 历史会话一次性回填（已完成，跳过）
 
-# 批量提取所有历史会话
+```bash
+# 精简模式：只提取 reward/insight/error/constraint/preference
 python3 scripts/batch_extractor.py --mode compact --limit 476
+# 约 5-7条/会话，476个会话约 300条记忆
 ```
 
-### 增量提取（新会话每小时自动）
+### 每小时增量（cron 自动运行，无需手动）
+
 ```bash
-python3 scripts/batch_extractor.py --mode full --limit 10
+# cron 自动调用 hourly_extractor.py
+python3 scripts/hourly_extractor.py
+```
+
+### 手动检索
+
+```bash
+# 关键词检索
+python3 scripts/recall_v2.py 飞书
+
+# 指定类型
+python3 scripts/recall_v2.py github --category error
+
+# 查看统计
+python3 scripts/memory_v2.py stats
 ```
 
 ## 脚本说明
 
-| 脚本 | 作用 |
-|------|------|
-| `session_extractor.py` | 核心引擎：读取会话 → 提取记忆 → 写入DB |
-| `batch_extractor.py` | 批量提取：配合cron自动运行 |
-| `memory_v2.py` | DB操作库：remember/recall/relate |
-| `recall_v2.py` | 检索工具：关键词+场景+时序查询 |
-| `memory_maintenance.py` | 维护工具：衰减/聚类/统计 |
-
-## 两种提取模式
-
-**compact 模式**（历史一次性）:
-- 只提取 `reward` + `insight` + `error` + `constraint` + `preference`
-- 跳过确认语、重复语、闲聊噪音
-- 去重：完全相同首行的只保留一条
-- 结果：约 7条/会话
-
-**full 模式**（每小时增量）:
-- 同 compact，增加 `fact` + `event`
-- 适合新会话全量积累
+| 脚本 | 作用 | 调用方式 |
+|------|------|----------|
+| `session_extractor.py` | 核心引擎：会话→记忆 | 内部调用 |
+| `batch_extractor.py` | 批量提取：支持 --mode/--limit | 手动/首次 |
+| `hourly_extractor.py` | cron 专用：增量提取新会话 | cron |
+| `recall_v2.py` | 检索：关键词+类型+时序 | 手动 |
+| `memory_v2.py` | DB 操作库 + CLI 工具 | 手动 |
 
 ## 数据规模
 
-- 476个历史会话 → 309条精选记忆
-- 每小时增量：预计新增 5-10条/天
-- DB大小：272KB（可持续增长）
+```
+历史会话:  476个会话 → 309条精选记忆
+每小时:   新增 5-10条
+数据库:   272KB（可持续增长）
+```
+
+## cron 配置
+
+| 项目 | 值 |
+|------|-----|
+| 任务 ID | `acf6cfefbdf6` |
+| 执行时间 | 每小时第 5 分钟 |
+| 命令 | `python3 scripts/hourly_extractor.py` |
+| 输出 | 本地文件，不打扰 |
 
 ## 项目状态
 
-✅ 历史全量回填完成  
-✅ 每小时增量cron运行中  
-🔧 持续观察 & 调优
+- ✅ 历史会话回填完成（2026-04-29）
+- ✅ 每小时增量 cron 运行中
+- ✅ 自动去重（相似度 > 80% 跳过）
+- 🔧 持续调优提取规则
 
-## License
+---
 
-MIT
+**仓库**: https://github.com/shishensbashen/AI_home  
+**子目录**: `memory-v2/`

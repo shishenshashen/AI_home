@@ -5,10 +5,10 @@
 """
 
 import sys, os, sqlite3
-sys.path.insert(0, '/root/.hermes/skills/memory-v2/scripts')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-STATE_DB = '/root/.hermes/state.db'
-MEMORY_DB = '/root/.hermes/memory_v2.db'
+STATE_DB = os.path.expanduser('~/.hermes/state.db')
+MEMORY_DB = os.path.expanduser('~/.hermes/memory_v2.db')
 
 
 def get_processed_session_ids():
@@ -56,7 +56,7 @@ def main():
     print(f"📦 待提取: {len(new_pending)}个新会话 (已处理: {len(processed)}个)\n")
     
     # 导入提取器
-    sys.path.insert(0, '/root/.hermes/skills/memory-v2/scripts')
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from session_extractor import auto_memorize
     
     total_new = 0

@@ -1,8 +1,31 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Databases (local only)
 *.db
-.DS_Store
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
 *.swp
 *.swo
+.DS_Store
+
+# Hermes agent (local)
 cron/output/
+memory_archive/
+state.db
+
+# Logs
+*.log
