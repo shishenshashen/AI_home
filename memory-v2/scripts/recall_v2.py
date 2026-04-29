@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-recall_v2 — 增强检索：支持场景隔离 + 时序过滤 + 原子记忆优先
+recall_v2 — 增强检索：FTS5粗筛 + 语义重排（Hybrid Search）
 用法: python3 recall_v2.py <query> [--scene <scene_id>] [--period <period>] [--limit 10]
 """
 
-import sys, os, sqlite3, json, re
+import sys, os, sqlite3, json, re, numpy as np
 from datetime import datetime, timedelta
 
 DB = os.path.expanduser('~/.hermes/memory_v2.db')
+
+# ─── 向量化 ─────────────────────────────────────
+_EMBED_FN = None
+
+def _get_embed():
+    global _EMBED_FN
+    if _EMBED_FN is None:
+        emb_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, emb_dir)
+        from embed import encode, cosine_sim
+        _EMBED_FN = (encode, cosine_sim)
+    return _EMBED_FN
 
 
 def jaccard(a, b):
@@ -38,56 +50,78 @@ def recall(query, scene_id=None, period=None, temporal_layer=None, limit=10):
 
     conditions = []
     params = []
-    
-    # 支持多个关键词 OR 查询
+
     keywords = [k for k in re.findall(r'[\u4e00-\u9fff\w]{2,}', query) if len(k) >= 2]
     if keywords:
         like_clauses = ["content LIKE ?" for _ in keywords]
-        conditions.append(f"({(' OR '.join(like_clauses))})")
+        conditions.append(f"({' OR '.join(like_clauses)})")
         params.extend([f"%{k}%" for k in keywords])
-    
+
     if scene_id:
         conditions.append("scene_id = ?")
         params.append(scene_id)
-    
+
     if period:
         conditions.append("period = ?")
         params.append(period)
-    
+
     if temporal_layer:
         conditions.append("temporal_layer = ?")
         params.append(temporal_layer)
-    
+
     where = " AND ".join(conditions) if conditions else "1=1"
-    
+
     rows = cur.execute(f"""
-        SELECT id, content, category, memory_type, tags, importance, 
-               hit_count, scene_id, temporal_layer, period, confidence, decay_score, created_at
+        SELECT id, content, category, memory_type, tags, importance,
+               hit_count, scene_id, temporal_layer, period, confidence, decay_score,
+               created_at, embedding
         FROM memory_index
         WHERE {where}
         ORDER BY importance DESC, hit_count DESC, created_at DESC
         LIMIT 100
     """, params).fetchall()
-    
+
     conn.close()
-    
+
     if not rows:
         return []
-    
-    # 语义+原子评分混合排序
+
+    # ── 语义重排 ─────────────────────────────────────
+    has_embedding = any(r['embedding'] for r in rows)
+    if has_embedding:
+        try:
+            encode_fn, cosine_sim_fn = _get_embed()
+            query_vec = encode_fn(query)
+            scored = []
+            for r in rows:
+                d = dict(r)
+                if d['embedding']:
+                    emb = json.loads(d['embedding'])
+                    d['_semantic'] = round(cosine_sim_fn(query_vec[0], emb), 3)
+                else:
+                    d['_semantic'] = 0.0
+                # 原子评分
+                d['_atomic'] = atomic_score(d['content'])
+                # 综合分: 0.5*语义 + 0.25*重要性 + 0.15*原子 + 0.1*命中
+                hit_norm = min(d['hit_count'] / 10.0, 1.0)
+                d['score'] = round(0.5*d['_semantic'] + 0.25*(d['importance']/5.0) + 0.15*d['_atomic'] + 0.1*hit_norm, 3)
+                scored.append(d)
+            scored.sort(key=lambda x: x['score'], reverse=True)
+            return scored[:limit]
+        except Exception:
+            pass  # 降级
+
+    # 降级：Jaccard + 原子评分
     results = []
     for r in rows:
         row_dict = dict(r)
         sim = jaccard(query, row_dict['content'])
         atom = atomic_score(row_dict['content'])
-        # 综合分 = 0.4*相似度 + 0.3*重要性 + 0.2*命中次数(归一化) + 0.1*原子化程度
         hit_norm = min(row_dict['hit_count'] / 10.0, 1.0)
         row_dict['score'] = round(0.4*sim + 0.3*(row_dict['importance']/5.0) + 0.2*hit_norm + 0.1*atom, 3)
         row_dict['sim'] = round(sim, 2)
         row_dict['atomic'] = round(atom, 2)
         results.append(row_dict)
-    
-    # 按综合分排序
     results.sort(key=lambda x: x['score'], reverse=True)
     return results[:limit]
 
@@ -167,7 +201,8 @@ def main():
     
     for r in results:
         tags = json.loads(r['tags']) if r['tags'] else []
-        print(f"  【{r['category']}】score={r['score']} sim={r['sim']} atomic={r['atomic']} imp={r['importance']} hit={r['hit_count']}")
+        sem = r.get('_semantic', '-')
+        print(f"  【{r['category']}】score={r['score']} semantic={sem} atomic={r.get('atomic', '-')} imp={r['importance']} hit={r['hit_count']}")
         print(f"    {r['content'][:100]}")
         if r['scene_id']:
             print(f"    🏷️ {r['scene_id']} | 📅 {r['period'] or 'today'}")

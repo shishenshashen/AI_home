@@ -18,6 +18,39 @@ from collections import Counter, defaultdict
 
 DB_PATH = os.path.expanduser("~/.hermes/memory_v2.db")
 
+# ─── Schema 迁移 ─────────────────────────────────────
+def _ensure_schema():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cols = [row[1] for row in cur.execute("PRAGMA table_info(memory_index)").fetchall()]
+    if "embedding" not in cols:
+        cur.execute("ALTER TABLE memory_index ADD COLUMN embedding TEXT")
+        conn.commit()
+    conn.close()
+
+_ensure_schema()
+
+# ─── 向量化 ─────────────────────────────────────
+_EMBED_MODEL = None
+
+def _get_embed_model():
+    """延迟加载 embedding 模型"""
+    global _EMBED_MODEL
+    if _EMBED_MODEL is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from embed import encode
+        _EMBED_MODEL = encode
+    return _EMBED_MODEL
+
+def _embed(content: str) -> str:
+    """生成语义向量并序列化为 JSON"""
+    try:
+        encode_fn = _get_embed_model()
+        vec = encode_fn(content[:500])
+        return vec[0]
+    except Exception:
+        return None  # 网络/模型失败时降级
+
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -51,15 +84,19 @@ def remember(content: str, category: str = "fact", importance: int = 3,
             return {"status": "skipped", "reason": "similar_content",
                     "existing_id": row["id"], "similarity": round(sim, 2)}
 
+    # 尝试生成语义向量
+    embedding_vec = _embed(content)
+    embedding_json = json.dumps(embedding_vec) if embedding_vec else None
+
     mem_id = str(uuid.uuid4())[:12]
     now = now_iso()
     tags_json = json.dumps(tags or ["通用"])
 
     cur.execute("""
         INSERT INTO memory_index (id, content, category, tags, source_session_id,
-                                  created_at, updated_at, importance, hit_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-    """, (mem_id, content[:500], category, tags_json, source_session, now, now, importance))
+                                  created_at, updated_at, importance, hit_count, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    """, (mem_id, content[:500], category, tags_json, source_session, now, now, importance, embedding_json))
 
     conn.commit()
     conn.close()
@@ -70,8 +107,9 @@ def recall(query: str, category: str = None, limit: int = 10) -> list:
     conn = get_conn()
     cur = conn.cursor()
 
+    # 1. 关键词粗筛
     sql = """
-        SELECT id, content, category, tags, importance, hit_count, created_at
+        SELECT id, content, category, tags, importance, hit_count, created_at, embedding
         FROM memory_index WHERE content LIKE ?
     """
     params = [f"%{query}%"]
@@ -79,11 +117,37 @@ def recall(query: str, category: str = None, limit: int = 10) -> list:
         sql += " AND category = ?"
         params.append(category)
     sql += " ORDER BY importance DESC, hit_count DESC LIMIT ?"
-    params.append(limit)
+    params.append(min(limit * 5, 50))  # 粗筛候选集上限50条
 
     rows = cur.execute(sql, params).fetchall()
+
+    # 2. 有 embedding 时做语义重排
+    if rows and rows[0]["embedding"]:
+        try:
+            embed_fn = _get_embed_model()
+            query_vec = embed_fn(query)
+            from embed import cosine_sim
+            scored = []
+            for row in rows:
+                emb = row["embedding"]
+                if emb:
+                    emb_list = json.loads(emb)
+                    sim = cosine_sim(query_vec[0], emb_list)
+                    d = dict(row)
+                    d["_semantic_score"] = round(sim, 3)
+                    scored.append(d)
+                else:
+                    d = dict(row)
+                    d["_semantic_score"] = 0.0
+                    scored.append(d)
+            scored.sort(key=lambda x: (x["_semantic_score"], x["importance"], x["hit_count"]), reverse=True)
+            conn.close()
+            return scored[:limit]
+        except Exception:
+            pass  # 降级到关键词排序
+
     conn.close()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows[:limit]]
 
 
 # ─── 话题系统 ─────────────────────────────────────
