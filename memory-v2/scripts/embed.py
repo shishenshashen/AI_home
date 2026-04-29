@@ -9,7 +9,10 @@ import sys
 import json
 import numpy as np
 
-_MODEL_DIR = os.path.expanduser("~/.hermes/embedding_model/iic/nlp_corom_sentence-embedding_chinese-tiny")
+# 优先加载仓库本地模型（git lfs），fallback 到 ~/.hermes/embedding_model/
+_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "iic", "nlp_corom_sentence-embedding_chinese-tiny")
+_HERMES_DIR = os.path.expanduser("~/.hermes/embedding_model/iic/nlp_corom_sentence-embedding_chinese-tiny")
+_MODEL_DIR = _LOCAL_DIR if os.path.exists(os.path.join(_LOCAL_DIR, "config.json")) else _HERMES_DIR
 _MODEL = None
 _TOKENIZER = None
 
