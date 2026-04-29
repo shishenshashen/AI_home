@@ -41,15 +41,68 @@ def get_pending_sessions(mode='full', limit=20):
     return rows
 
 
+def _backfill_embeddings():
+    """为无 embedding 的历史记忆批量生成向量"""
+    from memory_v2 import _get_embed_model, _embed, get_conn
+    import json
+
+    # 确保 schema 有 embedding 列
+    conn = get_conn()
+    cur = conn.cursor()
+
+    rows = cur.execute("""
+        SELECT id, content FROM memory_index
+        WHERE embedding IS NULL
+        ORDER BY created_at DESC
+    """).fetchall()
+    conn.close()
+
+    total = len(rows)
+    if total == 0:
+        print("✅ 所有记忆已有 embedding")
+        return
+
+    print(f"📊 需要回填: {total} 条记忆")
+    updated = 0
+    errors = 0
+
+    for i, (mem_id, content) in enumerate(rows):
+        try:
+            vec = _embed(content)
+            if vec:
+                conn2 = get_conn()
+                conn2.execute("UPDATE memory_index SET embedding=? WHERE id=?",
+                             (json.dumps(vec), mem_id))
+                conn2.commit()
+                conn2.close()
+                updated += 1
+            else:
+                errors += 1
+        except Exception as e:
+            errors += 1
+
+        if (i + 1) % 10 == 0:
+            print(f"  进度: {i+1}/{total} (已更新:{updated} 失败:{errors})")
+
+    print(f"\n✅ 回填完成: {updated}/{total} 条 (失败:{errors})")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', '-m', default='full', choices=['full', 'compact'])
     parser.add_argument('--limit', '-l', type=int, default=20)
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--backfill-embeddings', action='store_true',
+                        help='为历史记忆批量生成语义向量')
     args = parser.parse_args()
 
     from session_extractor import auto_memorize
+
+    # 回填历史 embedding
+    if args.backfill_embeddings:
+        _backfill_embeddings()
+        return
 
     processed = get_processed()
     pending = get_pending_sessions(mode=args.mode, limit=args.limit)
