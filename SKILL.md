@@ -1,216 +1,102 @@
-# Memory V2 Skill
+---
+name: memory-v2
+description: 从state.db提取有价值对话记忆到memory_v2.db，实现长期记忆积累
+triggers:
+  - 每小时cron自动提取新会话
+  - 历史会话一次性精简回填
+  - 新对话自动记录
+---
+
+# Memory V2 — 记忆提取系统
 
 ## 概述
 
-增强型记忆系统，解决 Hermes Agent 原有 memory 的局限：
+从 Hermes Agent 的 state.db 中提取有价值对话记忆，存入 memory_v2.db。实现**长期记忆积累**，避免每次重复相同错误。
 
-- ❌ 固定 2.2K/1.3K 字符槽位 → ✅ 无限存储
-- ❌ 无话题聚类 → ✅ 自动话题聚合
-- ❌ 无跨会话关联 → ✅ 知识图谱
-- ❌ 无冷热分层 → ✅ 自动归档
-- ❌ 无去重 → ✅ 相似度去重
+## 核心原则
 
-基于 SQLite 的多层存储架构：
+1. **只记高价值**：reward + insight + error + constraint + preference
+2. **不记闲聊**：确认语、重复语、礼貌废话全过滤
+3. **历史精简**：476个历史会话一次性精简提取，之后增量
+
+## 架构
 
 ```
-L1 热 (内存)      : 当前会话上下文
-L2 温 (SQLite)    : 7天内全文 + 话题索引
-L3 冷 (SQLite)    : 7-90天摘要化 + 话题树
-L4 归档 (GZIP)    : 90天+仅摘要
+state.db (476会话, 13K消息)
+    │
+    ├─ session_extractor.py   ← 核心引擎
+    ├─ batch_extractor.py     ← 批量提取脚本
+    └─ memory_v2.py          ← DB操作库
+              │
+              ▼
+memory_v2.db (272KB, 309条)
+    ├─ memory_index   (309条)
+    ├─ session_topics (44条)
+    └─ topics (49条)
 ```
 
-核心表：
-- `memory_index` — 记忆条目（分类、标签、引用计数）
-- `topics` — 话题节点（关键词、活跃度、摘要）
-- `knowledge_graph` — 跨类型关联关系
-- `session_topics` — 会话-话题多对多
+## 两种提取模式
 
----
+### mode='full' (新会话，每小时cron)
+全量提取：reward / insight / error / constraint / preference
 
-## 安装
+### mode='compact' (历史会话，一次性)
+只提取：
+- **reward**：✅完成/成功推送/配置完成/创建完成
+- **insight**：找到问题/原因/关键/本质/搞清楚
+- **error**：Traceback/报错/失败/异常
+- **constraint**：禁止/红线/必须/原则
+- **preference**：偏好/喜欢/讨厌/希望
 
-```bash
-# 1. 初始化数据库（自动）
-python3 ~/.hermes/skills/memory-v2/scripts/memory_v2.py stats
+## 关键文件
 
-# 2. 迁移旧记忆（可选）
-python3 ~/.hermes/skills/memory-v2/scripts/memory_v2.py migrate
-```
-
----
+| 文件 | 作用 |
+|------|------|
+| `scripts/session_extractor.py` | 核心引擎，auto_memorize() |
+| `scripts/batch_extractor.py` | 批量提取，支持--mode/--limit |
+| `scripts/memory_v2.py` | memory_v2.db 操作库 |
+| `memory_v2.db` | 精选记忆存储 |
 
 ## 用法
 
-### 基础操作
-
-```python
-from memory_client import MemoryClient
-mc = MemoryClient()
-
-# 记忆（自动去重）
-mc.remember("大哥要求所有飞书操作必须用lark-cli", 
-            category="workflow", importance=5, tags=["飞书"])
-
-# 检索
-results = mc.recall("lark-cli", category="workflow", limit=5)
-
-# 话题管理（会话结束后调用）
-topic_id = mc.create_topic_from_session(
-    session_id=session_id,
-    title="飞书操作规范",
-    keywords=["飞书", "lark-cli", "表格"],
-    summary="所有飞书操作必须用lark-cli替代REST API"
-)
-
-# 建立关联
-mc.connect("memory", mem_id, "topic", topic_id, "belongs_to")
-
-# 热点话题
-hot = mc.hot(limit=5)
-
-# 统计
-s = mc.stats()
-print(f"记忆: {s['memory_count']}, 话题: {s['topic_count']}")
-```
-
-### 维护命令
-
 ```bash
-# 查看统计
-python3 scripts/memory_v2.py stats
+# 测试单会话提取
+python3 session_extractor.py <session_id> [标题] --mode compact
 
-# 执行话题聚类（合并相似话题）
-python3 scripts/memory_v2.py cluster
+# 批量提取历史会话
+python3 batch_extractor.py --mode compact --limit 476
 
-# 冷热迁移（7天热→90天冷→归档）
-python3 scripts/memory_v2.py cold --days-hot 7 --days-cold 90 --archive ~/.hermes/memory_archive
+# 增量提取新会话
+python3 batch_extractor.py --mode full --limit 10
 ```
 
----
+## cron 配置
 
-## 集成到 Hermes Agent
+- **memory-v2增量提取** (job_id: acf6cfefbdf6)
+- 每小时第5分钟执行 (`5 * * * *`)
+- deliver: local
 
-### 1. 初始化
+## 当前状态 (2026-04-29)
 
-在 `run_agent.py` 或 agent 初始化时：
+- **memory_v2.db**: 309条记忆, 49个话题, 272KB
+- state.db: 476有效会话 → 历史精简完成，增量每小时提取
 
-```python
-from memory_client import MemoryClient
-memory_v2 = MemoryClient()
-agent.memory_v2 = memory_v2  # 挂载到 agent 实例
-```
+| 类型 | 数量 | 说明 |
+|------|------|------|
+| reward | 97 | 完成成果 |
+| insight | 56 | 发现/教训 |
+| preference | 40 | 偏好/习惯 |
+| fact | 32 | 客观事实 |
+| event | 32 | 事件记录 |
+| constraint | 26 | 原则/禁止 |
+| error | 24 | 错误/bug |
 
-### 2. 会话生命周期钩子
+## 提取结果类型
 
-```python
-# 会话开始
-def on_session_start(self, message):
-    keywords = self.memory_v2.on_session_start(message)
-    # 可选：预加载相关记忆
-    related = self.memory_v2.recall(" ".join(keywords[:3]))
-
-# 会话结束
-def on_session_end(self, session_id, messages):
-    # 提取会话主题
-    summary = self._summarize(messages)
-    keywords = self._extract_keywords(summary)
-    topic_id = create_topic_from_session(session_id, summary[:100], keywords, summary)
-    
-    # 关联本会话产生的记忆
-    # ...
-    
-    # 执行聚类（异步）
-    self.memory_v2.auto_cluster()
-```
-
-### 3. 替换 `memory` 工具
-
-修改 `tools/memory_tool.py`：
-
-```python
-def memory_tool(action, target="memory", content=None, old_text=None):
-    # 双写：旧文件 + 新数据库
-    old_result = old_memory_tool(action, target, content, old_text)
-    
-    # V2 写入
-    if action == "add" and content:
-        agent.memory_v2.remember(content, category=target, importance=3)
-    # ...
-    
-    return old_result
-```
-
-后期可完全切换：
-
-```python
-# Phase 2: 只写 V2
-if config.memory_v2_enabled:
-    result = agent.memory_v2.remember(...)
-else:
-    result = old_memory_tool(...)
-```
-
----
-
-## 配置
-
-在 `config.yaml` 中添加：
-
-```yaml
-memory_v2:
-  enabled: true
-  db_path: "~/.hermes/memory_v2.db"
-  auto_cluster: true        # 会话结束后自动聚类
-  cold_migration: true      # 启用冷热迁移
-  days_hot: 7
-  days_cold: 90
-  archive_dir: "~/.hermes/memory_archive"
-```
-
----
-
-## API 参考
-
-### MemoryClient
-
-| 方法 | 说明 |
-|------|------|
-| `remember(content, category, importance, tags)` | 记忆一条信息 |
-| `recall(query, category, limit)` | 关键词检索 |
-| `on_session_start(message)` | 会话开始，提取话题关键词 |
-| `get_current_topic()` | 获取当前会话话题 |
-| `hot(limit)` | 热话题排行 |
-| `connect(source_type, source_id, target_type, target_id, relation)` | 建立关联 |
-| `related_to(source_type, source_id)` | 查询关联 |
-| `auto_cluster()` | 执行聚类 |
-| `stats()` | 统计信息 |
-
-### 命令行脚本
-
-| 命令 | 说明 |
-|------|------|
-| `stats` | 查看统计 |
-| `cluster` | 合并相似话题 |
-| `cold` | 冷热迁移 |
-| `migrate` | 从旧记忆文件迁移 |
-
----
-
-## 注意事项
-
-1. **双写期间**：旧 `MEMORY.md`/`USER.md` 仍作为系统 prompt 注入源
-2. **去重阈值**：当前 Jaccard 相似度 >0.8 视为重复，可调整
-3. **话题聚类**：关键词重叠度 ≥50% 自动合并，阈值可调
-4. **冷热迁移**：建议每天凌晨 cron 执行
-5. **归档文件**：定期备份或清理 `~/.hermes/memory_archive/`
-
----
-
-## 未来增强
-
-- [ ] Embedding 向量化语义检索
-- [ ] 自动摘要生成（LLM）
-- [ ] 话题层级树（parent_id 递归）
-- [ ] 记忆重要性动态调整（基于 hit_count）
-- [ ] 会话内容自动标签化
-- [ ] 磁盘空间监控 + 自动清理
+| 类型 | 颜色 | 含义 |
+|------|------|------|
+| reward | 🟢 | 成功完成的成果 |
+| insight | 🔍 | 发现的规律/原因/教训 |
+| error | 🔴 | 错误/bug/失败 |
+| constraint | 🔵 | 原则/禁止/必须 |
+| preference | 🟡 | 用户偏好 |
