@@ -6,10 +6,10 @@
 """
 
 import sys, os, sqlite3
-sys.path.insert(0, '/root/.hermes/skills/memory-v2/scripts')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-STATE_DB = os.path.expanduser('/root/.hermes/state.db')
-MEMORY_DB = os.path.expanduser('/root/.hermes/memory_v2.db')
+STATE_DB = os.path.expanduser('~/.hermes/state.db')
+MEMORY_DB = os.path.expanduser('~/.hermes/memory_v2.db')
 
 
 def get_processed():
