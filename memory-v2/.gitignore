@@ -29,3 +29,6 @@ state.db
 
 # Logs
 *.log
+
+# Bundled model: pytorch_model.bin tracked via git lfs in .gitattributes
+# (do NOT add *.bin here — git lfs handles it)
